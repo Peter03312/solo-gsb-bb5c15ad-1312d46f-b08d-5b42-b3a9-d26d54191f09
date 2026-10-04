@@ -11,6 +11,10 @@
 的变更流（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销。下游报表**首次接入
 或重建索引**时，可经 `GET /devices/{id}/shift-snapshots` 按**固定变更序号**取得班次归因快照
 （只含与指定窗口相交、截至该序号已结算班次的最后修订），快照序号可直接作为变更流起始游标。
+每个新生成的班次修订都会**同事务固化不可变的归因区间明细**（`GET /shifts/{id}/result/segments`）：
+按起点排序、互不重叠的半开区间，逐段给出起止、原因及依据（生效裁定单号，或该区间内决定此原因的
+事件来源与版本列表），使结算总分钟数的每一段都可解释；历史修订若无法可靠还原裁定状态，
+明确返回明细不可用，不以当前状态推算。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -98,6 +102,17 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 - **结算与修订**：`POST /shifts/{id}/settle` 结算生成修订 1 并永久保留；迟到更正按事件时间
   （新旧版本区间的并集）重算受影响的已结算班次，现场裁定按上述规则一并参与重算；结果变化时
   追加新修订并记录与上一修订的差额（`delta`）；查询可用 `?revision=N` 指定历史修订。
+- **归因区间明细**：每个新生成的修订都与修订**同事务**固化一份不可变的区间明细
+  （`GET /shifts/{id}/result/segments?revision=N`，缺省为最新修订）：
+  - 返回按起点排序、互不重叠的半开区间段，每段含起止、分钟数、原因及**依据**——
+    生效裁定单号（`{"type":"ruling","ruling_no":...}`），或该区间内决定此原因的
+    事件来源与版本列表（`{"type":"events","event_versions":[...]}`）；
+  - 归因规则与结算一致：裁定按生效顺序覆盖事件，未裁定部分保养＞故障＞待判；
+    在依据变化处拆段，相邻且原因、依据相同的段合并；未停机分钟不返回；
+    各原因段分钟之和恒等于该修订的对应总数；
+  - 明细只插入不修改：事件更正或裁定撤销只影响之后的新修订，旧修订明细保持原样；
+  - 本结构引入前生成的历史修订未固化明细（当时的裁定状态无法可靠还原）：
+    返回 `available=false`、`segments=null`，**不以当前状态推算**。
 - **变更同步**：每次结算以及每次导致结果变化的更正 / 裁定 / 撤销产生一条变更记录
  （`seq` 全局递增，`trigger` 为 `settle` / `correction` / `adjudication` /
   `adjudication_revoke`），`GET /changes?cursor=&limit=` 按游标分页读取；修订与变更记录
@@ -120,6 +135,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/events/batch` | 断网补传：同一设备事件列表整批上报（全或无；逐项回执新建/幂等；全部幂等 200，否则 201） |
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
+| `GET` | `/shifts/{id}/result/segments?revision=N` | 该修订的归因区间明细（按起点排序的半开区间，含起止、原因及依据；历史修订未固化时返回不可用） |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
 | `POST` | `/shifts/{id}/adjudications` | 提交现场人工裁定（新建 201 / 幂等 200 / 单号冲突 409 / 未结算 409 / 越界 422） |
 | `POST` | `/shifts/{id}/adjudications/{rulingNo}/revoke` | 按单号撤销裁定（首次 201 / 重复撤销 200 / 未知单号 404） |
@@ -506,6 +522,70 @@ curl -X POST http://localhost:8000/events/confirm \
 同版本异内容、跳号与非法输入沿用既有约定（`409 VERSION_CONFLICT` / `409 VERSION_GAP` /
 `422 VALIDATION_ERROR` / `404 DEVICE_NOT_FOUND`）。
 
+## 归因区间明细（解释每个修订的分钟数构成）
+
+`GET /shifts/{id}/result/segments?revision=N` 返回某班次指定修订（缺省最新）的归因区间明细：
+结算总分钟数由哪些时间段、因何原因、依据什么得出。明细在修订生成时**同事务固化**、之后不可变。
+
+**1. 查询最新修订的明细**（接主流程第 9.4 步：班次 1 当前修订 4 为 保养 30 / 故障 45 / 待判 15）
+
+```bash
+curl 'http://localhost:8000/shifts/1/result/segments'
+```
+
+```json
+{
+  "shift_id": 1, "revision": 4, "latest_revision": 4, "available": true,
+  "segments": [
+    {"start": "2026-10-01T02:00:00Z", "end": "2026-10-01T02:30:00Z", "minutes": 30,
+     "reason": "maintenance",
+     "basis": {"type": "events",
+               "event_versions": [{"source_id": "MES-1", "version": 1, "reason": "maintenance"}]}},
+    {"start": "2026-10-01T02:30:00Z", "end": "2026-10-01T02:45:00Z", "minutes": 15,
+     "reason": "pending",
+     "basis": {"type": "ruling", "ruling_no": "R-20261001-001"}},
+    {"start": "2026-10-01T02:45:00Z", "end": "2026-10-01T03:15:00Z", "minutes": 30,
+     "reason": "failure",
+     "basis": {"type": "ruling", "ruling_no": "R-20261001-002"}},
+    {"start": "2026-10-01T03:15:00Z", "end": "2026-10-01T03:30:00Z", "minutes": 15,
+     "reason": "failure",
+     "basis": {"type": "events",
+               "event_versions": [{"source_id": "PLC-9", "version": 2, "reason": "failure"}]}}
+  ]
+}
+```
+
+> 段按起点排序、互不重叠（半开区间，UTC 输出）；只含停机分钟。
+> 逐段依据：10:00–10:30 由保养事件 MES-1 v1 决定；10:30–10:45 由生效裁定
+> R-20261001-001（待判）决定；10:45–11:15 由更晚生效的 R-20261001-002（故障）覆盖；
+> 11:15–11:30 回到事件归因（PLC-9 v2 故障）。各原因段分钟之和 = 该修订总数
+> （保养 30 / 故障 45 / 待判 15）。
+
+**2. 指定历史修订**：明细在固化后不可变 —— 撤销 R-20261001-002（产生修订 5）后，
+修订 4 的明细仍原样返回
+
+```bash
+curl -X POST http://localhost:8000/shifts/1/adjudications/R-20261001-002/revoke
+curl 'http://localhost:8000/shifts/1/result/segments?revision=4'   # 内容同上，不变
+curl 'http://localhost:8000/shifts/1/result/segments?revision=5'   # 回退后的新明细
+```
+
+**3. 本结构引入前生成的历史修订**：从旧版本升级上来的部署中，升级前已存在的修订
+未固化明细，且当时的裁定状态无法可靠还原 —— 明确返回不可用
+（`available=false`、`segments=null`），不以当前状态推算；升级后新生成的修订
+（含上述主流程中的全部修订）均正常返回明细
+
+```bash
+curl 'http://localhost:8000/shifts/1/result/segments?revision=1'   # 假设修订 1 为升级前生成
+```
+
+```json
+{"shift_id": 1, "revision": 1, "latest_revision": 5, "available": false, "segments": null}
+```
+
+**4. 错误语义**沿用现有约定：未知班次 `404 SHIFT_NOT_FOUND`、未结算
+`404 RESULT_NOT_FOUND`、未知修订 `404 REVISION_NOT_FOUND`、非法修订号 `422 VALIDATION_ERROR`。
+
 ## 变更同步（下游报表订阅）
 
 `GET /changes` 把每次**结算**与每次**导致结果变化的更正 / 现场裁定 / 撤销**暴露为按全局
@@ -699,6 +779,16 @@ curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:
   结算、更正重算与裁定写入对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一；裁定撤销只改
   自身状态并追加修订，从不改写历史修订与已返回的变更条目。
+- **归因区间明细**：`shift_result_segments` 与修订同事务写入、之后只读不改
+  （`(shift_id, revision, seg_no)` 唯一，复合外键指向 `shift_results`）。
+  计算（`attribution.attribute_segments`）以全部事件/裁定端点把班次窗口切成
+  覆盖集合恒定的基本区间：逐区间取生效顺序最新的裁定（依据 = 裁定单号），
+  无裁定区间按保养＞故障＞待判归因（依据 = 覆盖该区间且原因相符的事件版本列表）；
+  相邻且原因、依据相同的区间合并，未覆盖分钟不产生段 —— 与
+  `attribute_with_rulings` 同一套规则，各原因段分钟之和恒等于修订总数。
+  `shift_results.segments_available` 标记是否固化了明细：既有库启动迁移时
+  历史修订一律回填 `FALSE`（当时的裁定状态无法可靠还原），查询明确返回
+  明细不可用；新修订恒为 `TRUE`。
 - **变更订阅**：变更流直接读取修订表 —— `shift_results.seq` 即全局变更序号，修订与变更
   天然同事务提交/回滚；序号由单例计数器行（`change_counter`）在写事务内
   `UPDATE ... RETURNING` 递增分配，行锁持有至提交，故序号顺序 == 提交顺序，同步游标不会越过
@@ -724,13 +814,14 @@ app/
   db.py           # 引擎、会话、建库建表（含排他约束）
   config.py       # 环境变量配置
 tests/
-  test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退，无外部依赖，可 python3 直接跑）
+  test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退与区间明细拆段合并，无外部依赖，可 python3 直接跑）
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
   test_event_batch.py    # 断网补传（整批核对/全或无/重算/并发）端到端测试（需 PostgreSQL）
   test_event_preview.py  # 事件预演与确认（只读预演/凭据/状态复核/幂等重试/并发）端到端测试（需 PostgreSQL）
   test_shift_snapshots.py  # 班次快照（固定序号/相交过滤/稳定翻页/不可变/游标校验）端到端测试（需 PostgreSQL）
+  test_result_segments.py  # 归因区间明细（固化/不可变/依据形态/历史不可用/错误语义）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

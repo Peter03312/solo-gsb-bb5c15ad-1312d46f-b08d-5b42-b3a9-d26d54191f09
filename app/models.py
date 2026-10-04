@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     UniqueConstraint,
@@ -129,6 +131,12 @@ class ShiftResult(Base):
     event_versions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     # settle | correction | adjudication | adjudication_revoke
     trigger: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 是否固化了归因区间明细（shift_result_segments）。
+    # 本结构引入前生成的历史修订为 False：当时的裁定状态无法可靠还原，
+    # 查询明细时明确返回不可用，不得以当前状态推算。
+    segments_available: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -136,6 +144,46 @@ class ShiftResult(Base):
     __table_args__ = (
         UniqueConstraint("shift_id", "revision", name="uq_shift_result_revision"),
         UniqueConstraint("seq", name="uq_shift_results_seq"),
+    )
+
+
+class ShiftResultSegment(Base):
+    """班次修订的归因区间明细：与修订同事务写入，之后不可变（只插入、不更新）。
+
+    - 每段为半开区间 [start_ts, end_ts)，按 seg_no（即起点升序）排列、互不重叠；
+    - 只记录停机分钟（被事件或生效裁定覆盖的分钟），未停机分钟不产生段；
+    - basis 为 JSONB，两种形态：
+        {"type": "ruling", "ruling_no": "..."}                    —— 生效裁定单号
+        {"type": "events", "event_versions": [{"source_id", "version", "reason"}, ...]}
+          —— 该段内决定此原因的事件来源与版本列表
+    - 事件更正或裁定撤销只追加新修订的明细，历史修订的明细保持原样。
+    """
+
+    __tablename__ = "shift_result_segments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 段序号（按起点升序，从 1 开始）
+    seg_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    basis: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["shift_id", "revision"],
+            ["shift_results.shift_id", "shift_results.revision"],
+            name="fk_segment_result",
+        ),
+        UniqueConstraint(
+            "shift_id", "revision", "seg_no", name="uq_shift_result_segment"
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_segments_valid_range"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')", name="ck_segments_reason"
+        ),
     )
 
 

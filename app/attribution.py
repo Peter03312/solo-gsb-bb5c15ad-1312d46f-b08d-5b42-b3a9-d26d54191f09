@@ -200,6 +200,108 @@ def attribute(
     return _attribute_window(shift_start, shift_end, events)
 
 
+def attribute_segments(
+    shift_start: datetime,
+    shift_end: datetime,
+    events: Iterable[EventView],
+    rulings: Iterable[RulingView],
+) -> list[dict]:
+    """计算班次窗口 [shift_start, shift_end) 内的归因区间明细。
+
+    与 attribute_with_rulings 同一套规则（裁定按生效顺序覆盖事件，
+    未裁定部分保养 > 故障 > 待判，每分钟只归因一次），但返回的是按起点
+    排序、互不重叠的半开区间段列表，每段：
+
+      {"start": ..., "end": ..., "reason": ..., "basis": {...}}
+
+    basis（依据）两种形态：
+      - {"type": "ruling", "ruling_no": ...}：该段由生效裁定决定；
+      - {"type": "events", "event_versions": [{"source_id", "version", "reason"}, ...]}：
+        该段由事件归因决定，event_versions 为覆盖该段且原因即段原因的全部
+        事件版本（按 (source_id, version) 排序）。
+
+    语义：
+    - 在依据变化处拆段；相邻且原因、依据相同的段合并；
+    - 未停机分钟（无任何事件或裁定覆盖）不产生段；
+    - 各原因段分钟之和与 attribute_with_rulings 的 totals 一致。
+    """
+    clipped_events: list[tuple[datetime, datetime, EventView]] = []
+    for ev in events:
+        if ev.reason not in PRIORITY:
+            raise ValueError(f"unknown reason: {ev.reason!r}")
+        iv = _clip(ev.start, ev.end, shift_start, shift_end)
+        if iv is not None:
+            clipped_events.append((iv[0], iv[1], ev))
+
+    clipped_rulings: list[tuple[datetime, datetime, RulingView]] = []
+    for r in rulings:
+        if r.reason not in PRIORITY:
+            raise ValueError(f"unknown ruling reason: {r.reason!r}")
+        iv = _clip(r.start, r.end, shift_start, shift_end)
+        if iv is not None:
+            clipped_rulings.append((iv[0], iv[1], r))
+
+    # 以全部区间端点为界切成"基本区间"：同一基本区间内覆盖的事件/裁定集合恒定
+    points = {shift_start, shift_end}
+    for s, e, _ in clipped_events:
+        points.add(s)
+        points.add(e)
+    for s, e, _ in clipped_rulings:
+        points.add(s)
+        points.add(e)
+    pts = sorted(points)
+
+    # basis 键：("ruling", ruling_no) 或 ("events", ((source_id, version), ...))
+    segments: list[list] = []  # [start, end, reason, basis_key]
+    for s, e in zip(pts, pts[1:]):
+        if s >= e:
+            continue
+        winner: RulingView | None = None
+        for rs, re, r in clipped_rulings:
+            if rs <= s and re >= e and (winner is None or r.seq > winner.seq):
+                winner = r
+        if winner is not None:
+            reason = winner.reason
+            key = ("ruling", winner.ruling_no)
+        else:
+            active = [ev for es, ee, ev in clipped_events if es <= s and ee >= e]
+            if not active:
+                continue  # 未停机分钟：不产生段
+            reason = min((ev.reason for ev in active), key=lambda r: PRIORITY[r])
+            key = (
+                "events",
+                tuple(
+                    sorted(
+                        {
+                            (ev.source_id, ev.version)
+                            for ev in active
+                            if ev.reason == reason
+                        }
+                    )
+                ),
+            )
+        # 相邻且原因、依据相同 → 合并；否则在依据变化处拆段
+        if segments and segments[-1][1] == s and segments[-1][2] == reason and segments[-1][3] == key:
+            segments[-1][1] = e
+        else:
+            segments.append([s, e, reason, key])
+
+    out: list[dict] = []
+    for s, e, reason, key in segments:
+        if key[0] == "ruling":
+            basis = {"type": "ruling", "ruling_no": key[1]}
+        else:
+            basis = {
+                "type": "events",
+                "event_versions": [
+                    {"source_id": sid, "version": ver, "reason": reason}
+                    for sid, ver in key[1]
+                ],
+            }
+        out.append({"start": s, "end": e, "reason": reason, "basis": basis})
+    return out
+
+
 def attribute_with_rulings(
     shift_start: datetime,
     shift_end: datetime,

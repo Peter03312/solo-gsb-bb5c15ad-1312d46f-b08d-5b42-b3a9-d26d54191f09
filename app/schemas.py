@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -182,6 +182,56 @@ class ResultOut(BaseModel):
 class SettleResponse(BaseModel):
     settled: bool  # False 表示此前已结算，本次为幂等返回最新修订
     result: ResultOut
+
+
+# ---------------------------------------------------------------- 归因区间明细
+
+
+class SegmentBasisEvents(BaseModel):
+    """事件归因依据：该区间内决定此原因的事件来源与版本列表。"""
+
+    type: Literal["events"] = "events"
+    event_versions: list[EventVersionRef]
+
+
+class SegmentBasisRuling(BaseModel):
+    """裁定依据：决定该段原因的生效裁定单号。"""
+
+    type: Literal["ruling"] = "ruling"
+    ruling_no: str
+
+
+#: 归因区间段的依据（按 type 判别）
+SegmentBasis = Annotated[
+    SegmentBasisEvents | SegmentBasisRuling, Field(discriminator="type")
+]
+
+
+class ResultSegmentOut(BaseModel):
+    """一段归因区间明细：半开区间 [start, end)，含起止、原因及依据。"""
+
+    start: datetime
+    end: datetime
+    minutes: int  # 段分钟数 = (end - start)，便于直接汇总
+    reason: str  # maintenance | failure | pending
+    basis: SegmentBasis
+
+
+class ResultSegmentsOut(BaseModel):
+    """班次某修订的归因区间明细。
+
+    - segments 按起点排序、互不重叠；只含停机分钟（未停机分钟不返回），
+      各原因段分钟之和等于该修订的对应总数；
+    - 明细与修订同事务固化、不可变：事件更正或裁定撤销只影响之后的新修订；
+    - 本结构引入前生成的历史修订未固化明细（当时的裁定状态无法可靠还原），
+      available=False 且 segments 为 null —— 明确不可用，不以当前状态推算。
+    """
+
+    shift_id: int
+    revision: int
+    latest_revision: int
+    available: bool  # False 表示历史修订无明细（segments 为 null）
+    segments: list[ResultSegmentOut] | None
 
 
 class ChangeEntry(BaseModel):

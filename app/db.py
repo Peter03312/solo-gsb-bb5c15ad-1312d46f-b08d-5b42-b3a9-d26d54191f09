@@ -51,6 +51,42 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     _create_exclusion_constraint()
     _migrate_change_feed()
     _migrate_adjudications()
+    _migrate_segments()
+
+
+def _migrate_segments() -> None:
+    """为既有库补齐归因区间明细结构（幂等，可重复执行）。
+
+    - shift_result_segments 表由 create_all 直接建出；
+    - shift_results 增加 segments_available 标记：本结构引入前生成的历史修订
+      无法可靠还原当时的裁定状态，一律回填 FALSE（查询明细时明确返回不可用，
+      不以当前状态推算）；之后生成的新修订由写路径置 TRUE 并同事务写入明细。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE shift_results "
+                "ADD COLUMN IF NOT EXISTS segments_available BOOLEAN"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE shift_results SET segments_available = FALSE "
+                "WHERE segments_available IS NULL"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE shift_results "
+                "ALTER COLUMN segments_available SET NOT NULL"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE shift_results "
+                "ALTER COLUMN segments_available SET DEFAULT TRUE"
+            )
+        )
 
 
 def _migrate_adjudications() -> None:

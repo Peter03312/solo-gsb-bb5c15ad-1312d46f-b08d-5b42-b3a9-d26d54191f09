@@ -68,6 +68,17 @@ req POST /shifts/1/adjudications/R-002/revoke
 echo "-- 重复撤销：幂等 200，revision=null --"
 req POST /shifts/1/adjudications/R-002/revoke
 
+echo "-- 归因区间明细：最新修订（含裁定依据段），各原因段分钟之和应等于修订总数 --"
+req GET "/shifts/1/result/segments"
+
+echo "-- 指定修订的明细：修订 3（裁定 R-001 生效时）与修订 4（R-002 覆盖时），固化后不可变 --"
+req GET "/shifts/1/result/segments?revision=3"
+req GET "/shifts/1/result/segments?revision=4"
+
+echo "-- 未知班次 / 未知修订的明细查询：预期 404 SHIFT_NOT_FOUND / REVISION_NOT_FOUND --"
+req GET "/shifts/99999/result/segments"
+req GET "/shifts/1/result/segments?revision=99"
+
 echo "-- 断网补传（批量上报）：MES-1 v2 新建 + PLC-9 v2 幂等重试，预期 201，班次只产生一次修订 --"
 req POST /events/batch '{"device_id":"CNC-01","events":[
   {"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"},

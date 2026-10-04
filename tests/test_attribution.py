@@ -13,6 +13,7 @@ from app.attribution import (  # noqa: E402
     EventView,
     RulingView,
     attribute,
+    attribute_segments,
     attribute_with_rulings,
     merge,
     subtract,
@@ -274,6 +275,214 @@ def test_ruling_then_free_then_ruling_windows():
     )
     assert totals == {"maintenance": 120, "failure": 60, "pending": 0}
     assert used == [{"source_id": "F1", "version": 2, "reason": "failure"}]
+
+
+# ---------------------------------------------------------------- 归因区间明细
+
+
+def _seg(start_h, end_h, reason, basis):
+    """构造期望段：basis 简写 ("ruling", no) 或 ("events", [(src, ver), ...])。"""
+    if basis[0] == "ruling":
+        b = {"type": "ruling", "ruling_no": basis[1]}
+    else:
+        b = {
+            "type": "events",
+            "event_versions": [
+                {"source_id": s, "version": v, "reason": reason} for s, v in basis[1]
+            ],
+        }
+    return {"start": start_h, "end": end_h, "reason": reason, "basis": b}
+
+
+def _assert_segment_invariants(segs, lo, hi):
+    """段列表通用不变量：按起点排序、互不重叠的半开区间，且都在窗口内。"""
+    for a, b in zip(segs, segs[1:]):
+        assert a["end"] <= b["start"]  # 不重叠（允许相接）
+    for s in segs:
+        assert lo <= s["start"] < s["end"] <= hi
+
+
+def _totals_of(segs):
+    totals = {"maintenance": 0, "failure": 0, "pending": 0}
+    for s in segs:
+        totals[s["reason"]] += int((s["end"] - s["start"]).total_seconds()) // 60
+    return totals
+
+
+def test_segments_empty_when_no_downtime():
+    assert attribute_segments(h(8), h(16), [], []) == []
+    # 事件完全在班次窗口外 → 无段
+    assert attribute_segments(h(8), h(16), [ev("M1", 1, "maintenance", h(2), h(4))], []) == []
+
+
+def test_segments_single_event_and_clipping():
+    segs = attribute_segments(h(8), h(16), [ev("M1", 3, "maintenance", h(7), h(9))], [])
+    assert segs == [_seg(h(8), h(9), "maintenance", ("events", [("M1", 3)]))]
+
+
+def test_segments_non_downtime_minutes_not_returned():
+    # 10-11 停机，其余分钟未停机 → 只有一段
+    segs = attribute_segments(h(8), h(16), [ev("F1", 1, "failure", h(10), h(11))], [])
+    assert segs == [_seg(h(10), h(11), "failure", ("events", [("F1", 1)]))]
+
+
+def test_segments_priority_and_basis_change_split():
+    # 保养 [10,12) 全程压过故障 [11,13)：11 点处故障"被覆盖状态"变化但保养段
+    # 原因与依据不变 → 保养合并为一段；故障只计 [12,13)
+    segs = attribute_segments(
+        h(8),
+        h(16),
+        [
+            ev("M1", 1, "maintenance", h(10), h(12)),
+            ev("F1", 1, "failure", h(11), h(13)),
+        ],
+        [],
+    )
+    assert segs == [
+        _seg(h(10), h(12), "maintenance", ("events", [("M1", 1)])),
+        _seg(h(12), h(13), "failure", ("events", [("F1", 1)])),
+    ]
+
+
+def test_segments_split_where_event_basis_set_changes():
+    # 同原因事件集合变化处拆段：[10,11) 仅 F1；[11,12) F1+F2；[12,13) 仅 F2
+    segs = attribute_segments(
+        h(8),
+        h(16),
+        [
+            ev("F1", 1, "failure", h(10), h(12)),
+            ev("F2", 4, "failure", h(11), h(13)),
+        ],
+        [],
+    )
+    assert segs == [
+        _seg(h(10), h(11), "failure", ("events", [("F1", 1)])),
+        _seg(h(11), h(12), "failure", ("events", [("F1", 1), ("F2", 4)])),
+        _seg(h(12), h(13), "failure", ("events", [("F2", 4)])),
+    ]
+
+
+def test_segments_adjacent_same_reason_and_basis_merged():
+    # 两个来源的保养事件首尾相接但依据不同 → 不合并
+    segs = attribute_segments(
+        h(8),
+        h(16),
+        [
+            ev("M1", 1, "maintenance", h(10), h(11)),
+            ev("M2", 1, "maintenance", h(11), h(12)),
+        ],
+        [],
+    )
+    assert segs == [
+        _seg(h(10), h(11), "maintenance", ("events", [("M1", 1)])),
+        _seg(h(11), h(12), "maintenance", ("events", [("M2", 1)])),
+    ]
+    # 同一事件被自身端点切分后依据不变 → 合并为一段（单事件 [10,12)）
+    segs = attribute_segments(
+        h(8), h(16), [ev("M1", 2, "maintenance", h(10), h(12))], []
+    )
+    assert segs == [_seg(h(10), h(12), "maintenance", ("events", [("M1", 2)]))]
+
+
+def test_segments_ruling_overrides_events():
+    # 裁定 [10:30,11:30) 故障，覆盖保养事件 [10,12)；裁定外保养 [11:30,12) 仍生效
+    segs = attribute_segments(
+        h(8),
+        h(16),
+        [ev("M1", 1, "maintenance", h(10), h(12))],
+        [rv("R-1", "failure", h(10, 30), h(11, 30), 1)],
+    )
+    assert segs == [
+        _seg(h(10), h(10, 30), "maintenance", ("events", [("M1", 1)])),
+        _seg(h(10, 30), h(11, 30), "failure", ("ruling", "R-1")),
+        _seg(h(11, 30), h(12), "maintenance", ("events", [("M1", 1)])),
+    ]
+
+
+def test_segments_overlapping_rulings_latest_seq_wins():
+    # R1 pending [10,12)，R2 failure [11,13)：重叠的 [11,12) 由 seq 更大的 R2 决定；
+    # [11,12) 与 [12,13) 原因、依据相同且相邻 → 合并为一段
+    segs = attribute_segments(
+        h(8),
+        h(16),
+        [],
+        [
+            rv("R1", "pending", h(10), h(12), 1),
+            rv("R2", "failure", h(11), h(13), 2),
+        ],
+    )
+    assert segs == [
+        _seg(h(10), h(11), "pending", ("ruling", "R1")),
+        _seg(h(11), h(13), "failure", ("ruling", "R2")),
+    ]
+
+
+def test_segments_ruling_clipped_to_shift_window():
+    segs = attribute_segments(
+        h(8), h(16), [], [rv("R1", "failure", h(7), h(8, 30), 1)]
+    )
+    assert segs == [_seg(h(8), h(8, 30), "failure", ("ruling", "R1"))]
+
+
+def test_segments_totals_match_attribute_with_rulings():
+    # 复杂场景：段分钟数按原因汇总须与归因总数一致
+    events = [
+        ev("M1", 1, "maintenance", h(9), h(11)),
+        ev("M2", 2, "maintenance", h(10), h(12)),
+        ev("F1", 1, "failure", h(10), h(14)),
+        ev("P1", 1, "pending", h(8), h(16)),
+    ]
+    rulings = [
+        rv("R1", "pending", h(11), h(12), 1),
+        rv("R2", "failure", h(11, 30), h(13), 2),
+    ]
+    segs = attribute_segments(h(8), h(16), events, rulings)
+    totals, _used = attribute_with_rulings(h(8), h(16), events, rulings)
+    assert _totals_of(segs) == totals
+    _assert_segment_invariants(segs, h(8), h(16))
+
+
+def test_segments_invariants_randomized():
+    # 确定性伪随机场景（整分钟对齐，与线上输入约束一致）：
+    # 不变量 + 与 attribute_with_rulings 总数一致
+    import random
+
+    def rand_ts(lo_min: int, hi_min: int) -> datetime:
+        return BASE + timedelta(minutes=rng.randint(lo_min, hi_min))
+
+    rng = random.Random(20261004)
+    for _ in range(100):
+        events = []
+        for i in range(rng.randint(0, 5)):
+            s = rand_ts(6 * 60, 15 * 60)
+            e = s + timedelta(minutes=rng.randint(1, 180))
+            events.append(
+                ev(
+                    f"S{i}",
+                    rng.randint(1, 3),
+                    rng.choice(["maintenance", "failure", "pending"]),
+                    s,
+                    e,
+                )
+            )
+        rulings = []
+        for i in range(rng.randint(0, 3)):
+            s = rand_ts(8 * 60, 15 * 60)
+            e = s + timedelta(minutes=rng.randint(1, 120))
+            rulings.append(
+                RulingView(
+                    ruling_no=f"R{i}",
+                    reason=rng.choice(["maintenance", "failure", "pending"]),
+                    start=s,
+                    end=e,
+                    seq=i + 1,
+                )
+            )
+        segs = attribute_segments(h(8), h(16), events, rulings)
+        totals, _ = attribute_with_rulings(h(8), h(16), events, rulings)
+        assert _totals_of(segs) == totals
+        _assert_segment_invariants(segs, h(8), h(16))
+
 
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")]

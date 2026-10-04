@@ -33,6 +33,8 @@ from .schemas import (
     ReasonMinutes,
     RecomputedShift,
     ResultOut,
+    ResultSegmentOut,
+    ResultSegmentsOut,
     RevisionRef,
     SettleResponse,
     ShiftCreate,
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -65,7 +67,10 @@ app = FastAPI(
         "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
         "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步；"
         "GET /devices/{device_id}/shift-snapshots 提供按固定变更序号的班次归因快照，"
-        "供下游报表首次接入或重建索引。"
+        "供下游报表首次接入或重建索引；"
+        "GET /shifts/{shift_id}/result/segments 提供与修订同事务固化的不可变归因区间"
+        "明细（按起点排序、互不重叠的半开区间，含起止、原因及依据），"
+        "历史修订未固化明细时明确返回不可用。"
     ),
     lifespan=lifespan,
 )
@@ -319,6 +324,56 @@ def list_revisions(shift_id: int, db: Session = Depends(get_db)):
     shift, revs = services.list_revisions(db, shift_id)
     latest_revision = revs[-1].revision if revs else 0
     return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+@app.get(
+    "/shifts/{shift_id}/result/segments",
+    response_model=ResultSegmentsOut,
+    tags=["attribution"],
+)
+def get_result_segments(
+    shift_id: int,
+    revision: int | None = Query(default=None, ge=1, description="指定修订号，缺省为最新"),
+    db: Session = Depends(get_db),
+):
+    """查询班次某修订的归因区间明细（解释各原因分钟数的构成）。
+
+    - 返回按起点排序、互不重叠的半开区间段，每段含起止、分钟数、原因及依据
+      （生效裁定单号，或该区间内决定此原因的事件来源与版本列表）；
+    - 只含停机分钟；各原因段分钟之和等于该修订的对应总数；
+    - 明细与修订同事务固化、不可变：事件更正或裁定撤销后旧修订明细保持原样；
+    - 本结构引入前生成的历史修订未固化明细：available=false 且 segments=null
+      （明确不可用，不以当前状态推算）；
+    - 未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
+      未知修订 404 REVISION_NOT_FOUND。
+    """
+    shift, rev, latest_revision, segments = services.get_result_segments(
+        db, shift_id, revision
+    )
+    if segments is None:
+        return ResultSegmentsOut(
+            shift_id=shift.id,
+            revision=rev.revision,
+            latest_revision=latest_revision,
+            available=False,
+            segments=None,
+        )
+    return ResultSegmentsOut(
+        shift_id=shift.id,
+        revision=rev.revision,
+        latest_revision=latest_revision,
+        available=True,
+        segments=[
+            ResultSegmentOut(
+                start=seg.start_ts,
+                end=seg.end_ts,
+                minutes=int((seg.end_ts - seg.start_ts).total_seconds()) // 60,
+                reason=seg.reason,
+                basis=seg.basis,
+            )
+            for seg in segments
+        ],
+    )
 
 
 # ---------------------------------------------------------------- 现场人工裁定

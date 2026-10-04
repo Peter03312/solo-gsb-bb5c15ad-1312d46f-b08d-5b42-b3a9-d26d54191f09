@@ -25,6 +25,7 @@ from .models import (
     ManualAdjudication,
     Shift,
     ShiftResult,
+    ShiftResultSegment,
 )
 from .schemas import (
     AdjudicationIn,
@@ -193,12 +194,17 @@ def _latest_revision(db: Session, shift_id: int) -> ShiftResult | None:
     )
 
 
-def _compute(db: Session, shift: Shift) -> tuple[dict, list[dict]]:
+def _compute(db: Session, shift: Shift) -> tuple[dict, list[dict], list[dict]]:
+    """按当前生效事件与裁定计算班次的 (totals, used_versions, segments)。"""
     events = _current_event_views(db, shift.device_id, shift.start_ts, shift.end_ts)
     rulings = _active_ruling_views(db, shift.id)
-    return attribution.attribute_with_rulings(
+    totals, used = attribution.attribute_with_rulings(
         shift.start_ts, shift.end_ts, events, rulings
     )
+    segments = attribution.attribute_segments(
+        shift.start_ts, shift.end_ts, events, rulings
+    )
+    return totals, used, segments
 
 
 def _active_ruling_views(db: Session, shift_id: int) -> list[RulingView]:
@@ -234,6 +240,7 @@ def _new_revision(
     used: list[dict],
     trigger: str,
     base: ShiftResult | None,
+    segments: list[dict],
 ) -> ShiftResult:
     if base is None:
         revision, bm, bf, bp = 1, 0, 0, 0
@@ -256,8 +263,22 @@ def _new_revision(
         d_pending=totals["pending"] - bp,
         event_versions=used,
         trigger=trigger,
+        segments_available=True,
     )
     db.add(rev)
+    # 归因区间明细与修订同事务固化：只插入、之后不更新不删除
+    for seg_no, seg in enumerate(segments, start=1):
+        db.add(
+            ShiftResultSegment(
+                shift_id=shift.id,
+                revision=revision,
+                seg_no=seg_no,
+                start_ts=seg["start"],
+                end_ts=seg["end"],
+                reason=seg["reason"],
+                basis=seg["basis"],
+            )
+        )
     return rev
 
 
@@ -274,8 +295,10 @@ def settle_shift(db: Session, shift_id: int) -> tuple[Shift, ShiftResult, bool]:
     latest = _latest_revision(db, shift_id)
     if latest is not None:
         return shift, latest, False
-    totals, used = _compute(db, shift)
-    rev = _new_revision(db, shift, totals, used, trigger="settle", base=None)
+    totals, used, segments = _compute(db, shift)
+    rev = _new_revision(
+        db, shift, totals, used, trigger="settle", base=None, segments=segments
+    )
     db.commit()
     db.refresh(rev)
     return shift, rev, True
@@ -549,14 +572,17 @@ def _recompute_affected_shifts(
         latest = _latest_revision(db, shift.id)
         if latest is None:
             continue  # 尚未结算：结算时自然会使用最新事件版本
-        totals, used = _compute(db, shift)
+        totals, used, segments = _compute(db, shift)
         if (
             totals["maintenance"] == latest.maintenance_minutes
             and totals["failure"] == latest.failure_minutes
             and totals["pending"] == latest.pending_minutes
         ):
             continue  # 结果未变化，不产生空修订
-        rev = _new_revision(db, shift, totals, used, trigger="correction", base=latest)
+        rev = _new_revision(
+            db, shift, totals, used, trigger="correction", base=latest,
+            segments=segments,
+        )
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
@@ -976,14 +1002,15 @@ def _recompute_after_ruling(
 ) -> ShiftResult | None:
     """裁定/撤销后重算班次：仅当各原因分钟数变化时追加新修订并记录差额。"""
     latest = _latest_revision(db, shift.id)
-    totals, used = _compute(db, shift)
+    totals, used, segments = _compute(db, shift)
     if (
         totals["maintenance"] == latest.maintenance_minutes
         and totals["failure"] == latest.failure_minutes
         and totals["pending"] == latest.pending_minutes
     ):
         return None  # 分钟数无变化：无修订、无变更，历史修订保持不变
-    rev = _new_revision(db, shift, totals, used, trigger=trigger, base=latest)
+    rev = _new_revision(db, shift, totals, used, trigger=trigger, base=latest,
+                        segments=segments)
     db.flush()
     return rev
 
@@ -1163,6 +1190,35 @@ def list_revisions(db: Session, shift_id: int) -> tuple[Shift, list[ShiftResult]
         .all()
     )
     return shift, list(revs)
+
+
+def get_result_segments(
+    db: Session, shift_id: int, revision: int | None
+) -> tuple[Shift, ShiftResult, int, list[ShiftResultSegment] | None]:
+    """班次某修订的归因区间明细。
+
+    返回 (班次, 修订, 最新修订号, 明细段列表或 None)；None 表示该修订未固化
+    明细（本结构引入前生成的历史修订，当时的裁定状态无法可靠还原），
+    调用方应明确返回明细不可用，不得以当前状态推算。
+    错误语义与 get_result 一致：未知班次 404 SHIFT_NOT_FOUND、
+    未结算 404 RESULT_NOT_FOUND、未知修订 404 REVISION_NOT_FOUND。
+    """
+    shift, rev, latest_revision = get_result(db, shift_id, revision)
+    if not rev.segments_available:
+        return shift, rev, latest_revision, None
+    rows = (
+        db.execute(
+            select(ShiftResultSegment)
+            .where(
+                ShiftResultSegment.shift_id == shift_id,
+                ShiftResultSegment.revision == rev.revision,
+            )
+            .order_by(ShiftResultSegment.seg_no)
+        )
+        .scalars()
+        .all()
+    )
+    return shift, rev, latest_revision, list(rows)
 
 
 # ---------------------------------------------------------------- 变更同步
