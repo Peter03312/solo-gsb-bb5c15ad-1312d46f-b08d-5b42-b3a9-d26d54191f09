@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→归因区间明细→班次快照 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -47,6 +47,14 @@ req GET "/shifts/1/result"
 req GET "/shifts/1/result?revision=1"
 req GET "/shifts/1/revisions"
 
+echo "-- 归因区间明细：修订 2（更正后）返回按起点排序的半开区间 + 原因 + 依据，各段分钟之和等于 totals --"
+req GET "/shifts/1/revisions/2/attribution"
+echo "-- 修订 1（结算时）明细同样不可变 --"
+req GET "/shifts/1/revisions/1/attribution"
+echo "-- 未知修订：预期 404 REVISION_NOT_FOUND；修订号非正：预期 422 --"
+req GET "/shifts/1/revisions/99/attribution"
+req GET "/shifts/1/revisions/0/attribution"
+
 echo "-- 现场人工裁定：10:30-11:30 改判故障（11:00-11:30 本就是故障），预期 revision=3、maintenance -30 / failure +30 --"
 req POST /shifts/1/adjudications '{"ruling_no":"R-001","start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure","note":"现场核对为传动故障"}'
 
@@ -67,6 +75,29 @@ req POST /shifts/1/adjudications/R-002/revoke
 
 echo "-- 重复撤销：幂等 200，revision=null --"
 req POST /shifts/1/adjudications/R-002/revoke
+
+echo "-- 归因区间明细：取最新修订，校验区间按起点排序/互不重叠/半开，且各段分钟之和等于 totals --"
+LATEST_REV="$(curl -sS "$BASE/shifts/1/result" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+echo "最新修订号：$LATEST_REV"
+curl -sS "$BASE/shifts/1/revisions/$LATEST_REV/attribution" | python3 -c '
+import sys, json
+from datetime import datetime
+b = json.load(sys.stdin)
+assert b["available"] is True, b
+segs = b["segments"]
+def p(x): return datetime.fromisoformat(x.replace("Z","+00:00"))
+starts = [p(s["start"]) for s in segs]
+assert starts == sorted(starts), "segments not sorted"
+for a, c in zip(segs, segs[1:]):
+    assert p(a["end"]) <= p(c["start"]), "segments overlap"
+sums = {"maintenance":0,"failure":0,"pending":0}
+for s in segs:
+    assert s["minutes"] == int((p(s["end"])-p(s["start"])).total_seconds())//60
+    sums[s["reason"]] += s["minutes"]
+assert sums == b["totals"], (sums, b["totals"])
+print("明细不变量校验通过：", sums, "=", b["totals"])
+'
+echo
 
 echo "-- 断网补传（批量上报）：MES-1 v2 新建 + PLC-9 v2 幂等重试，预期 201，班次只产生一次修订 --"
 req POST /events/batch '{"device_id":"CNC-01","events":[

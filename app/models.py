@@ -127,6 +127,12 @@ class ShiftResult(Base):
     d_pending: Mapped[int] = mapped_column(Integer, nullable=False)
     # 本次计算所依据的事件版本：[{"source_id", "version", "reason"}, ...]
     event_versions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # 本轮新增：与修订同事务固化的不可变归因区间明细。
+    # [{"start","end","reason","basis": {"type":"ruling","ruling_no"} |
+    #  {"type":"events","events":[{source_id,version,reason}]}}, ...]
+    # 按起点排序、互不重叠、半开；旧修订回填前为 NULL，表示明细不可用
+    # （历史裁定状态无法可靠还原，不得以当前状态推算）。
+    attribution_detail: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # settle | correction | adjudication | adjudication_revoke
     trigger: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(

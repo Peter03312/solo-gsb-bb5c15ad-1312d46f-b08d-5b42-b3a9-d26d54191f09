@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import attribution
-from .attribution import EventView, RulingView
+from .attribution import AttributionSegment, EventView, RulingView
 from .config import settings
 from .models import (
     ChangeCounter,
@@ -51,6 +51,25 @@ def _utc(dt: datetime) -> datetime:
 def _content_hash(start: datetime, end: datetime, reason: str) -> str:
     raw = f"{start.isoformat()}|{end.isoformat()}|{reason}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _serialize_segments(segments: list[AttributionSegment]) -> list[dict]:
+    """把归因区间明细转为可落库 JSONB / 直接返回的纯数据（时间统一 UTC、Z 结尾）。"""
+    out: list[dict] = []
+    for seg in segments:
+        out.append(
+            {
+                "start": seg.start.astimezone(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "end": seg.end.astimezone(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "reason": seg.reason,
+                "basis": seg.basis,
+            }
+        )
+    return out
 
 
 def get_device_or_404(db: Session, device_id: str) -> Device:
@@ -193,12 +212,20 @@ def _latest_revision(db: Session, shift_id: int) -> ShiftResult | None:
     )
 
 
-def _compute(db: Session, shift: Shift) -> tuple[dict, list[dict]]:
+def _compute(
+    db: Session, shift: Shift
+) -> tuple[dict, list[dict], list[AttributionSegment]]:
+    """按当前生效事件与裁定重算班次，返回 (totals, used_versions, 归因区间明细)。
+
+    区间明细与 totals 由同一组输入一次算出（互相一致），修订固化时一并落库。
+    """
     events = _current_event_views(db, shift.device_id, shift.start_ts, shift.end_ts)
     rulings = _active_ruling_views(db, shift.id)
-    return attribution.attribute_with_rulings(
+    segments = attribution.attribute_segments(
         shift.start_ts, shift.end_ts, events, rulings
     )
+    totals, used = attribution.summarize_segments(segments)
+    return totals, used, segments
 
 
 def _active_ruling_views(db: Session, shift_id: int) -> list[RulingView]:
@@ -234,6 +261,7 @@ def _new_revision(
     used: list[dict],
     trigger: str,
     base: ShiftResult | None,
+    segments: list[AttributionSegment] | None = None,
 ) -> ShiftResult:
     if base is None:
         revision, bm, bf, bp = 1, 0, 0, 0
@@ -255,6 +283,9 @@ def _new_revision(
         d_failure=totals["failure"] - bf,
         d_pending=totals["pending"] - bp,
         event_versions=used,
+        attribution_detail=(
+            _serialize_segments(segments) if segments is not None else []
+        ),
         trigger=trigger,
     )
     db.add(rev)
@@ -274,8 +305,10 @@ def settle_shift(db: Session, shift_id: int) -> tuple[Shift, ShiftResult, bool]:
     latest = _latest_revision(db, shift_id)
     if latest is not None:
         return shift, latest, False
-    totals, used = _compute(db, shift)
-    rev = _new_revision(db, shift, totals, used, trigger="settle", base=None)
+    totals, used, segments = _compute(db, shift)
+    rev = _new_revision(
+        db, shift, totals, used, trigger="settle", base=None, segments=segments
+    )
     db.commit()
     db.refresh(rev)
     return shift, rev, True
@@ -549,14 +582,22 @@ def _recompute_affected_shifts(
         latest = _latest_revision(db, shift.id)
         if latest is None:
             continue  # 尚未结算：结算时自然会使用最新事件版本
-        totals, used = _compute(db, shift)
+        totals, used, segments = _compute(db, shift)
         if (
             totals["maintenance"] == latest.maintenance_minutes
             and totals["failure"] == latest.failure_minutes
             and totals["pending"] == latest.pending_minutes
         ):
             continue  # 结果未变化，不产生空修订
-        rev = _new_revision(db, shift, totals, used, trigger="correction", base=latest)
+        rev = _new_revision(
+            db,
+            shift,
+            totals,
+            used,
+            trigger="correction",
+            base=latest,
+            segments=segments,
+        )
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
@@ -976,14 +1017,16 @@ def _recompute_after_ruling(
 ) -> ShiftResult | None:
     """裁定/撤销后重算班次：仅当各原因分钟数变化时追加新修订并记录差额。"""
     latest = _latest_revision(db, shift.id)
-    totals, used = _compute(db, shift)
+    totals, used, segments = _compute(db, shift)
     if (
         totals["maintenance"] == latest.maintenance_minutes
         and totals["failure"] == latest.failure_minutes
         and totals["pending"] == latest.pending_minutes
     ):
         return None  # 分钟数无变化：无修订、无变更，历史修订保持不变
-    rev = _new_revision(db, shift, totals, used, trigger=trigger, base=latest)
+    rev = _new_revision(
+        db, shift, totals, used, trigger=trigger, base=latest, segments=segments
+    )
     db.flush()
     return rev
 
@@ -1149,6 +1192,37 @@ def get_result(
             404, "REVISION_NOT_FOUND", f"shift id={shift_id} has no revision {revision}"
         )
     return shift, rev, latest.revision
+
+
+def get_attribution_detail(
+    db: Session, shift_id: int, revision: int
+) -> tuple[Shift, ShiftResult, bool]:
+    """返回某班次某修订与其不可变归因区间明细。
+
+    返回 (班次, 修订, 明细是否可用)。沿用既有错误语义：未知班次
+    404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、未知修订
+    404 REVISION_NOT_FOUND。明细只读本修订固化的快照；历史修订若
+    无法可靠还原裁定状态（attribution_detail 为 NULL），明确返回
+    available=False，绝不用当前事件/裁定状态推算。
+    """
+    shift = get_shift_or_404(db, shift_id)
+    rev = db.execute(
+        select(ShiftResult).where(
+            ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+        )
+    ).scalar_one_or_none()
+    if rev is None:
+        if _latest_revision(db, shift_id) is None:
+            raise ApiError(
+                404, "RESULT_NOT_FOUND", f"shift id={shift_id} has not been settled"
+            )
+        raise ApiError(
+            404,
+            "REVISION_NOT_FOUND",
+            f"shift id={shift_id} has no revision {revision}",
+        )
+    available = rev.attribution_detail is not None
+    return shift, rev, available
 
 
 def list_revisions(db: Session, shift_id: int) -> tuple[Shift, list[ShiftResult]]:

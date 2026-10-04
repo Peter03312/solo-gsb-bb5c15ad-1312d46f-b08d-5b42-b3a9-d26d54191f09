@@ -11,6 +11,10 @@
 的变更流（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销。下游报表**首次接入
 或重建索引**时，可经 `GET /devices/{id}/shift-snapshots` 按**固定变更序号**取得班次归因快照
 （只含与指定窗口相交、截至该序号已结算班次的最后修订），快照序号可直接作为变更流起始游标。
+**每个修订**（本轮起新生成）还在**同一事务固化不可变的归因区间明细**，经
+`GET /shifts/{id}/revisions/{revision}/attribution` 按班次与修订号查询：返回按起点排序、
+互不重叠的半开区间，含起止、原因及依据（生效裁定单号，或该区间内决定此原因的事件来源与
+版本列表）；本轮变更前的历史修订若无法可靠还原当时裁定状态，明确返回明细不可用。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -98,6 +102,22 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 - **结算与修订**：`POST /shifts/{id}/settle` 结算生成修订 1 并永久保留；迟到更正按事件时间
   （新旧版本区间的并集）重算受影响的已结算班次，现场裁定按上述规则一并参与重算；结果变化时
   追加新修订并记录与上一修订的差额（`delta`）；查询可用 `?revision=N` 指定历史修订。
+- **归因区间明细（不可变，本轮新增）**：每个**本轮起新生成**的修订（结算 / 更正 / 裁定 /
+  撤销）都与修订在**同一事务**固化一份不可变的归因区间明细，可经
+  `GET /shifts/{id}/revisions/{N}/attribution` 查询：
+  - 返回按起点排序、**互不重叠的半开区间** `[start, end)`，每段含 `start`/`end`/`minutes`/
+    `reason` 与 `basis`；不返回**未停机分钟**；
+  - **依据**：裁定分钟 `basis={"type":"ruling","ruling_no":...}`（生效顺序最新的未撤销
+    裁定单号）；未裁定分钟 `basis={"type":"events","events":[{source_id,version,reason},...]}`，
+    即该区间内按 保养 > 故障 > 待判 胜出原因的**全部覆盖事件版本**；
+  - 裁定沿用现有生效顺序覆盖事件，未裁定部分沿用 保养 > 故障 > 待判；**在依据变化处拆段**
+    （胜出裁定不同、或胜出事件集合不同），**相邻且原因、依据相同的段合并**；
+  - 各原因区间分钟之和（也即所有段 `minutes` 之和）**等于该修订总数**（响应中的 `totals`）；
+  - 明细随修订只追加、不重写：事件更正或裁定撤销后，**旧修订明细保持原样**；
+  - 本轮变更前的**历史修订**（落库时未固化明细）若无法可靠还原当时的裁定状态，
+    **明确返回 `available=false`、`segments=null` 及不可用原因，绝不用当前事件/裁定状态推算**；
+  - 错误语义沿用结果查询：未知班次 `404 SHIFT_NOT_FOUND`、未结算 `404 RESULT_NOT_FOUND`、
+    未知修订 `404 REVISION_NOT_FOUND`。
 - **变更同步**：每次结算以及每次导致结果变化的更正 / 裁定 / 撤销产生一条变更记录
  （`seq` 全局递增，`trigger` 为 `settle` / `correction` / `adjudication` /
   `adjudication_revoke`），`GET /changes?cursor=&limit=` 按游标分页读取；修订与变更记录
@@ -121,6 +141,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
+| `GET` | `/shifts/{id}/revisions/{revision}/attribution` | 某修订的**不可变归因区间明细**（半开区间+原因+依据；历史修订无明细时 `available=false`） |
 | `POST` | `/shifts/{id}/adjudications` | 提交现场人工裁定（新建 201 / 幂等 200 / 单号冲突 409 / 未结算 409 / 越界 422） |
 | `POST` | `/shifts/{id}/adjudications/{rulingNo}/revoke` | 按单号撤销裁定（首次 201 / 重复撤销 200 / 未知单号 404） |
 | `GET` | `/shifts/{id}/adjudications` | 班次的全部裁定（含已撤销，按生效顺序） |
@@ -506,6 +527,123 @@ curl -X POST http://localhost:8000/events/confirm \
 同版本异内容、跳号与非法输入沿用既有约定（`409 VERSION_CONFLICT` / `409 VERSION_GAP` /
 `422 VALIDATION_ERROR` / `404 DEVICE_NOT_FOUND`）。
 
+## 归因区间明细查询（修订为什么是这些分钟）
+
+各原因的结算**总分钟数**本身无法解释“某段时间为什么这样归因”。为此，**本轮起每个新生成的
+修订**（结算 / 更正 / 裁定 / 撤销）都在**同一事务**固化一份不可变的**归因区间明细**，可按
+班次与修订号经 `GET /shifts/{shift_id}/revisions/{revision}/attribution` 获取。
+
+**返回语义**
+
+- `segments` 为按 `start` 升序、**互不重叠的半开区间** `[start, end)`，每段含：
+  - `start` / `end`：UTC 时间（`...Z`）；`minutes = end − start`；
+  - `reason`：该区间最终原因（`maintenance` / `failure` / `pending`）；
+  - `basis`：依据。
+    - 裁定分钟 → `{"type":"ruling","ruling_no":"R-...","events":null}`：决定该区间的
+      **生效裁定单号**（生效顺序最新的未撤销裁定，裁定之间不比原因优先级）；
+    - 未裁定分钟 → `{"type":"events","ruling_no":null,"events":[{"source_id",
+      "version","reason"}, ...]}`：该区间内按 **保养 > 故障 > 待判** 胜出原因的**全部
+      覆盖事件版本**（只含实际贡献分钟者）。
+- **在依据变化处拆段**：胜出裁定不同、或胜出事件集合不同，即另起一段；相邻且原因、依据都
+  相同的段已合并；**不返回未停机分钟**（无裁定且无事件覆盖的空档不出现）。
+- 所有段 `minutes` 按原因求和 **等于该修订 `totals`**（响应内附 `totals` 便于核对）。
+- 明细随修订**只追加、不重写**：之后事件更正、提交/撤销裁定只会产生新修订，**旧修订明细
+  保持原样**，重读结果一致。
+- 本轮变更前的**历史修订**没有固化明细：返回 `200` 但 `available=false`、`segments=null`，
+  并在 `reason` 字段说明“无法可靠还原当时裁定状态”，**不用当前状态推算**。
+- 错误语义与结果查询一致：未知班次 `404 SHIFT_NOT_FOUND`、班次未结算
+  `404 RESULT_NOT_FOUND`、未知修订 `404 REVISION_NOT_FOUND`、修订号非正整数 `422`。
+
+**调用示例**（接续主流程：班次 1 已结算；以下演示结算、裁定、更正后的明细）
+
+```bash
+# 1) 修订 1（结算）：保养 10:00–12:00，故障 11:00–13:00（11–12 被保养覆盖）
+curl http://localhost:8000/shifts/1/revisions/1/attribution
+```
+
+```json
+{
+  "shift_id": 1,
+  "device_id": "CNC-01",
+  "shift_start": "2026-10-01T00:00:00Z",
+  "shift_end": "2026-10-01T08:00:00Z",
+  "revision": 1,
+  "totals": {"maintenance": 120, "failure": 60, "pending": 0},
+  "available": true,
+  "segments": [
+    {"start": "2026-10-01T02:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "minutes": 120, "reason": "maintenance",
+     "basis": {"type": "events", "ruling_no": null,
+               "events": [{"source_id": "MES-1", "version": 1, "reason": "maintenance"}]}},
+    {"start": "2026-10-01T04:00:00Z", "end": "2026-10-01T05:00:00Z",
+     "minutes": 60, "reason": "failure",
+     "basis": {"type": "events", "ruling_no": null,
+               "events": [{"source_id": "PLC-9", "version": 1, "reason": "failure"}]}}
+  ],
+  "reason": null
+}
+```
+
+> 11:00–12:00（UTC 03:00–04:00）故障与保养重叠，按优先级归保养，故只在保养段出现；
+> 段首尾相接、不重不漏，`120 + 60 = totals` 之和。
+
+```bash
+# 2) 提交裁定 11:00–12:00 改判待判 → 产生修订 2；该段依据变为裁定单号
+curl -X POST http://localhost:8000/shifts/1/adjudications \
+  -H 'Content-Type: application/json' \
+  -d '{"ruling_no":"R-20261001-001",
+       "start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00",
+       "reason":"pending","note":"传感器无记录，待质检复核"}'
+
+curl http://localhost:8000/shifts/1/revisions/2/attribution
+```
+
+```json
+{
+  "revision": 2,
+  "totals": {"maintenance": 60, "failure": 60, "pending": 60},
+  "available": true,
+  "segments": [
+    {"start": "2026-10-01T02:00:00Z", "end": "2026-10-01T03:00:00Z",
+     "minutes": 60, "reason": "maintenance",
+     "basis": {"type": "events", "ruling_no": null,
+               "events": [{"source_id": "MES-1", "version": 1, "reason": "maintenance"}]}},
+    {"start": "2026-10-01T03:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "minutes": 60, "reason": "pending",
+     "basis": {"type": "ruling", "ruling_no": "R-20261001-001", "events": null}},
+    {"start": "2026-10-01T04:00:00Z", "end": "2026-10-01T05:00:00Z",
+     "minutes": 60, "reason": "failure",
+     "basis": {"type": "events", "ruling_no": null,
+               "events": [{"source_id": "PLC-9", "version": 1, "reason": "failure"}]}}
+  ],
+  "reason": null
+}
+```
+
+```bash
+# 3) 随后事件更正（保养缩短）只产生修订 3；修订 1、2 的明细重读保持原样
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"MES-1","version":2,
+       "start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00",
+       "reason":"maintenance"}'
+
+curl http://localhost:8000/shifts/1/revisions/2/attribution   # 仍是上面的旧明细（不可变）
+curl http://localhost:8000/shifts/1/revisions/3/attribution   # 反映更正后的新明细
+
+# 4) 本轮变更前的历史修订（无固化明细）→ available=false，不用当前状态推算
+curl http://localhost:8000/shifts/1/revisions/1/attribution
+# 200 {"revision":1,"available":false,"segments":null,
+#      "reason":"revision predates immutable attribution details; ...","totals":{...}}
+
+# 5) 错误语义：未知班次 404 SHIFT_NOT_FOUND；未结算 404 RESULT_NOT_FOUND；
+#    未知修订 404 REVISION_NOT_FOUND；修订号非正整数 422
+curl http://localhost:8000/shifts/99999/revisions/1/attribution
+curl http://localhost:8000/shifts/1/revisions/99/attribution
+```
+
+> 各修订明细与该修订的 `totals` 严格对账：可在客户端校验
+> `sum(segment.minutes for reason) == totals[reason]`。
+
 ## 变更同步（下游报表订阅）
 
 `GET /changes` 把每次**结算**与每次**导致结果变化的更正 / 现场裁定 / 撤销**暴露为按全局
@@ -672,6 +810,11 @@ curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:
   现场裁定（`attribute_with_rulings`）逐分钟取生效顺序（seq，即落库 id）最新的未撤销裁定，
   裁定分钟绝对覆盖事件；事件只在扣除全部裁定区间后的剩余窗口内做上述优先级归因，
   因此撤销最新裁定后重叠分钟自然回退到此前裁定或事件。
+  归因区间明细（`attribute_segments` + `summarize_segments`）用同一套裁剪/优先级口径：
+  按事件与裁定的全部端点切出依据恒定的最小段，每段裁定分钟以覆盖它的 seq 最大裁定单号为
+  依据，其余分钟以优先级胜出原因的全部覆盖事件版本为依据，再合并相邻同因同依据段、丢弃无
+  覆盖空档；`summarize_segments` 汇总出的 totals / used_versions 与 `attribute_with_rulings`
+  严格一致（随机用例已对账），保证“各段分钟之和 == 修订总数”。
 - **版本链与幂等**：`event_sources` 表保存每个 `(设备, 来源)` 的 `last_version` 与内容哈希，
   上报时 `INSERT ... ON CONFLICT DO NOTHING` + `SELECT ... FOR UPDATE` 串行化校验；
   内容哈希 = `sha256(start_utc|end_utc|reason)`。
@@ -698,7 +841,12 @@ curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:
 - **并发与一致性**：班次不重叠由 PostgreSQL 排他约束（`btree_gist` + `tstzrange '[)'`）兜底；
   结算、更正重算与裁定写入对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一；裁定撤销只改
-  自身状态并追加修订，从不改写历史修订与已返回的变更条目。
+  自身状态并追加修订，从不改写历史修订与已返回的变更条目。本轮起每个新修订还在同一行
+  （`shift_results.attribution_detail`，JSONB）**同事务固化不可变归因区间明细**
+  （`attribute_segments` 产出：按全部区间端点切出依据恒定的最小段，裁定分钟取覆盖它的
+  生效顺序最新裁定为依据，其余分钟取优先级胜出原因的全部覆盖事件为依据，再合并相邻同因
+  同依据段），事件更正 / 裁定撤销后旧修订明细保持原样；该列为 NULL 的历史修订查询时明确
+  返回 `available=false`，绝不以当前状态反推。
 - **变更订阅**：变更流直接读取修订表 —— `shift_results.seq` 即全局变更序号，修订与变更
   天然同事务提交/回滚；序号由单例计数器行（`change_counter`）在写事务内
   `UPDATE ... RETURNING` 递增分配，行锁持有至提交，故序号顺序 == 提交顺序，同步游标不会越过
@@ -731,6 +879,7 @@ tests/
   test_event_batch.py    # 断网补传（整批核对/全或无/重算/并发）端到端测试（需 PostgreSQL）
   test_event_preview.py  # 事件预演与确认（只读预演/凭据/状态复核/幂等重试/并发）端到端测试（需 PostgreSQL）
   test_shift_snapshots.py  # 班次快照（固定序号/相交过滤/稳定翻页/不可变/游标校验）端到端测试（需 PostgreSQL）
+  test_attribution_detail.py  # 归因区间明细（拆段/合并/依据/求和/不可变/历史不可用/错误语义）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

@@ -51,6 +51,23 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     _create_exclusion_constraint()
     _migrate_change_feed()
     _migrate_adjudications()
+    _migrate_attribution_detail()
+
+
+def _migrate_attribution_detail() -> None:
+    """为本轮新增的归因区间明细补齐既有库结构（幂等，可重复执行）。
+
+    shift_results.attribution_detail 为 JSONB：本轮起每个新修订在同事务
+    固化其不可变区间明细；既有历史修订该列保持 NULL，查询时明确返回
+    "明细不可用"，不用当前事件/裁定状态推算（历史裁定状态无法可靠还原）。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE shift_results ADD COLUMN IF NOT EXISTS "
+                "attribution_detail JSONB"
+            )
+        )
 
 
 def _migrate_adjudications() -> None:

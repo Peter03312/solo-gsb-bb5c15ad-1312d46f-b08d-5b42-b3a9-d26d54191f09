@@ -18,6 +18,9 @@ from .schemas import (
     AdjudicationAck,
     AdjudicationIn,
     AdjudicationOut,
+    AttributionBasis,
+    AttributionDetailOut,
+    AttributionInterval,
     ChangeEntry,
     ChangePage,
     DeviceCreate,
@@ -52,7 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -63,6 +66,9 @@ app = FastAPI(
         "（全或无：逐项核对版本链，任一非法整批失败）；"
         "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
         "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
+        "每个修订同事务固化不可变归因区间明细，经 "
+        "GET /shifts/{id}/revisions/{revision}/attribution 查询"
+        "（按起点排序、互不重叠的半开区间，含原因与依据）；"
         "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步；"
         "GET /devices/{device_id}/shift-snapshots 提供按固定变更序号的班次归因快照，"
         "供下游报表首次接入或重建索引。"
@@ -319,6 +325,64 @@ def list_revisions(shift_id: int, db: Session = Depends(get_db)):
     shift, revs = services.list_revisions(db, shift_id)
     latest_revision = revs[-1].revision if revs else 0
     return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+@app.get(
+    "/shifts/{shift_id}/revisions/{revision}/attribution",
+    response_model=AttributionDetailOut,
+    tags=["attribution"],
+)
+def get_attribution_detail(shift_id: int, revision: int, db: Session = Depends(get_db)):
+    """查询某班次某修订的**不可变归因区间明细**。
+
+    返回按起点排序、互不重叠的半开区间 [start, end)，每段含原因与依据：
+    生效裁定单号（basis.type=ruling），或该区间内决定此原因的事件来源与
+    版本列表（basis.type=events）。裁定按生效顺序覆盖事件，未裁定部分按
+    保养 > 故障 > 待判；依据变化处拆段，相邻且原因/依据相同的段已合并；
+    不返回未停机分钟，各原因区间分钟之和等于该修订 totals。
+
+    明细与修订在同一事务固化，事件更正或裁定撤销后旧修订明细保持原样。
+    本轮变更前的历史修订若无法可靠还原当时裁定状态，返回 200 但
+    available=false、segments=null（不得用当前状态推算）。
+    未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
+    未知修订 404 REVISION_NOT_FOUND（与既有结果查询错误语义一致）。
+    """
+    shift, rev, available = services.get_attribution_detail(db, shift_id, revision)
+    segments = None
+    if available:
+        segments = []
+        for seg in rev.attribution_detail:
+            start = datetime.fromisoformat(seg["start"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(seg["end"].replace("Z", "+00:00"))
+            segments.append(
+                AttributionInterval(
+                    start=start,
+                    end=end,
+                    minutes=int((end - start).total_seconds()) // 60,
+                    reason=seg["reason"],
+                    basis=AttributionBasis(**seg["basis"]),
+                )
+            )
+    return AttributionDetailOut(
+        shift_id=shift.id,
+        device_id=shift.device_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=rev.revision,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+        available=available,
+        segments=segments,
+        reason=(
+            None
+            if available
+            else "revision predates immutable attribution details; "
+            "its ruling state cannot be reliably reconstructed"
+        ),
+    )
 
 
 # ---------------------------------------------------------------- 现场人工裁定

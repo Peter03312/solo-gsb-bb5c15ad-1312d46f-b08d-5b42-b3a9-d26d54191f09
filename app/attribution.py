@@ -49,6 +49,25 @@ class RulingView:
     seq: int  # 生效顺序（落库顺序），重叠分钟取 seq 最大的裁定
 
 
+@dataclass(frozen=True)
+class AttributionSegment:
+    """一段停机归因区间明细（半开 [start, end)）。
+
+    - reason   : 该区间最终归因原因；
+    - basis    : 依据。裁定区间为 {"type": "ruling", "ruling_no": ...}；
+                 事件区间为 {"type": "events", "events": [{"source_id",
+                 "version", "reason"}, ...]}（该区间内决定此原因的全部
+                 事件版本，即归因优先级下胜出原因的覆盖事件集合）。
+
+    同一原因、同一依据的相邻区间在产出时已合并；未停机分钟不会产生段。
+    """
+
+    start: datetime
+    end: datetime
+    reason: str
+    basis: dict
+
+
 def merge(intervals: Iterable[Interval]) -> list[Interval]:
     """合并重叠或相接的半开区间，返回按起点排序的不重叠区间列表。"""
     out: list[list[datetime]] = []
@@ -264,3 +283,173 @@ def attribute_with_rulings(
         {(item["source_id"], item["version"], item["reason"]): item for item in used}.values(),
         key=_key,
     )
+
+
+# --------------------------------------------------------------- 归因区间明细
+
+
+def _event_ref(ev: EventView) -> dict:
+    return {"source_id": ev.source_id, "version": ev.version, "reason": ev.reason}
+
+
+def _basis_key(basis: dict) -> tuple:
+    """依据的可比较标识：依据不同即在此处拆段。"""
+    if basis["type"] == "ruling":
+        return ("ruling", basis["ruling_no"])
+    return (
+        "events",
+        tuple(
+            sorted(
+                (e["source_id"], e["version"], e["reason"]) for e in basis["events"]
+            )
+        ),
+    )
+
+
+def _events_basis(events: list[EventView]) -> dict:
+    return {"type": "events", "events": [_event_ref(ev) for ev in events]}
+
+
+def attribute_segments(
+    shift_start: datetime,
+    shift_end: datetime,
+    events: Iterable[EventView],
+    rulings: Iterable[RulingView],
+) -> list[AttributionSegment]:
+    """计算班次内停机归因的**区间明细**（不可变快照的原始材料）。
+
+    逐段（而非逐分钟）判定，产出按起点排序、互不重叠的半开区间：
+      - 裁定沿用现有生效顺序覆盖事件：某分钟由覆盖它的、seq 最大的
+        未撤销裁定决定（裁定之间不比原因优先级），依据为该裁定单号；
+      - 未裁定分钟沿用 保养 > 故障 > 待判，依据为该段内胜出原因的
+        全部覆盖事件版本（与 attribute_with_rulings 中 used_versions
+        口径一致：只列对最终原因实际有贡献的事件）；
+      - 在依据变化处拆段（胜出裁定不同、或胜出事件集合不同）；
+      - 相邻且原因、依据均相同的段合并；
+      - 不产出未停机分钟（无裁定且无任何事件覆盖的分钟）。
+
+    各段分钟之和（按原因）与 attribute_with_rulings 的 totals 严格一致。
+    """
+    # 裁剪到班次窗口内的事件 / 裁定（与汇总归因同一裁剪口径）
+    clipped_events: list[EventView] = []
+    for ev in events:
+        if ev.reason not in PRIORITY:
+            raise ValueError(f"unknown reason: {ev.reason!r}")
+        s, e = max(ev.start, shift_start), min(ev.end, shift_end)
+        if s < e:
+            clipped_events.append(
+                EventView(
+                    source_id=ev.source_id,
+                    version=ev.version,
+                    reason=ev.reason,
+                    start=s,
+                    end=e,
+                )
+            )
+
+    clipped_rulings: list[RulingView] = []
+    for r in rulings:
+        if r.reason not in PRIORITY:
+            raise ValueError(f"unknown ruling reason: {r.reason!r}")
+        s, e = max(r.start, shift_start), min(r.end, shift_end)
+        if s < e:
+            clipped_rulings.append(
+                RulingView(ruling_no=r.ruling_no, reason=r.reason, start=s, end=e, seq=r.seq)
+            )
+
+    # 所有原始切片：每个区间（事件或裁定）各自覆盖 [start, end)。
+    # 每个切片携带其 kind 与“若此切片单独决定一分钟”所需信息。
+    # 先收集全部断点，切出依据恒定的最小段，再为每段选胜出者。
+    raw: list[dict] = []  # {"s","e","kind","reason", winner-data}
+    for ev in clipped_events:
+        raw.append({"s": ev.start, "e": ev.end, "kind": "event", "ev": ev})
+    for r in clipped_rulings:
+        raw.append({"s": r.start, "e": r.end, "kind": "ruling", "rv": r})
+
+    if not raw:
+        return []
+
+    # 断点（全部原始区间端点），相邻断点之间无任何覆盖关系变化
+    points = sorted({shift_start, shift_end, *(x["s"] for x in raw), *(x["e"] for x in raw)})
+
+    # 预先按起点排序原始区间，便于逐段增量判定（班次/事件规模都很小，
+    # 直接线性扫描即可，保持与纯标准库算法一致的可读性）
+    raw_sorted = sorted(raw, key=lambda x: (x["s"], x["e"]))
+
+    segments: list[AttributionSegment] = []
+    for lo, hi in zip(points, points[1:]):
+        if lo < shift_start or hi > shift_end or lo >= hi:
+            continue
+        # 覆盖该最小段 [lo, hi) 的所有原始区间（半开：s < hi and e > lo）
+        covering = [x for x in raw_sorted if x["s"] < hi and x["e"] > lo]
+        ruling_winners = [x for x in covering if x["kind"] == "ruling"]
+        if ruling_winners:
+            # 生效顺序最新（seq 最大）的未撤销裁定绝对覆盖事件
+            win = max(ruling_winners, key=lambda x: x["rv"].seq)["rv"]
+            segments.append(
+                AttributionSegment(
+                    start=lo,
+                    end=hi,
+                    reason=win.reason,
+                    basis={"type": "ruling", "ruling_no": win.ruling_no},
+                )
+            )
+            continue
+        cov_events = [x["ev"] for x in covering]
+        if not cov_events:
+            continue  # 未停机分钟：不产出段
+        # 保养 > 故障 > 待判：取覆盖该段的事件中优先级最高（数值最小）的原因
+        winner_reason = min(
+            (ev.reason for ev in cov_events), key=lambda reason: PRIORITY[reason]
+        )
+        # 依据 = 该段内所有以胜出原因覆盖的事件版本（含并列共同决定者）
+        winners = [ev for ev in cov_events if ev.reason == winner_reason]
+        segments.append(
+            AttributionSegment(
+                start=lo,
+                end=hi,
+                reason=winner_reason,
+                basis=_events_basis(winners),
+            )
+        )
+
+    # 合并相邻（端点相接）且原因、依据均相同的段
+    merged: list[AttributionSegment] = []
+    for seg in segments:
+        if (
+            merged
+            and merged[-1].end == seg.start
+            and merged[-1].reason == seg.reason
+            and _basis_key(merged[-1].basis) == _basis_key(seg.basis)
+        ):
+            merged[-1] = AttributionSegment(
+                start=merged[-1].start,
+                end=seg.end,
+                reason=seg.reason,
+                basis=seg.basis,
+            )
+        else:
+            merged.append(seg)
+    return merged
+
+
+def summarize_segments(
+    segments: Iterable[AttributionSegment],
+) -> tuple[dict[str, int], list[dict]]:
+    """从区间明细汇总 (totals, used_event_versions)。
+
+    与 attribute_with_rulings 的返回口径一致：used 仅含实际贡献了停机
+    分钟的事件版本（裁定单号不计入事件版本列表），按原因优先级排序。
+    """
+    totals = {r: 0 for r in REASONS}
+    used_map: dict[tuple[str, int, str], dict] = {}
+    for seg in segments:
+        totals[seg.reason] += int((seg.end - seg.start).total_seconds()) // 60
+        if seg.basis["type"] == "events":
+            for ref in seg.basis["events"]:
+                used_map[(ref["source_id"], ref["version"], ref["reason"])] = ref
+    used = sorted(
+        used_map.values(),
+        key=lambda item: (PRIORITY[item["reason"]], item["source_id"], item["version"]),
+    )
+    return totals, used

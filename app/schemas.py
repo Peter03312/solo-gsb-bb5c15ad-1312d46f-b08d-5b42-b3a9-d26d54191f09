@@ -284,3 +284,50 @@ class AdjudicationAck(BaseModel):
     revision: int | None  # 本次操作产生的修订号；无修订为 null
     latest_revision: int  # 班次当前最新修订号
     revision_detail: RevisionRef | None = None  # 本次修订摘要；无修订为 null
+
+
+# ---------------------------------------------------------------- 归因区间明细
+
+
+class AttributionBasis(BaseModel):
+    """一段停机区间的归因依据。
+
+    - type="ruling"：依据为生效裁定，ruling_no 为决定该区间原因的裁定单号；
+    - type="events"：依据为事件，events 为该区间内决定此原因的全部事件版本
+      （归因优先级下胜出原因的覆盖事件集合，只含实际贡献分钟者）。
+    """
+
+    type: Literal["ruling", "events"]
+    ruling_no: str | None = None
+    events: list[EventVersionRef] | None = None
+
+
+class AttributionInterval(BaseModel):
+    """一个不可变归因区间：半开 [start, end)，按起点排序、互不重叠。"""
+
+    start: datetime
+    end: datetime
+    minutes: int  # 区间分钟数 = (end - start)，便于核对各段之和等于修订总数
+    reason: Reason
+    basis: AttributionBasis
+
+
+class AttributionDetailOut(BaseModel):
+    """某班次某修订的归因区间明细（与修订同事务固化，不可变）。
+
+    - available=True：segments 为按起点排序、互不重叠的半开区间，不含未停机
+      分钟；各原因区间分钟之和等于 totals（即该修订总数）；
+    - available=False：该修订为本轮变更前的历史修订，无法可靠还原其当时的
+      裁定状态，明细不可用（segments 为 null），不得用当前状态推算。
+    """
+
+    shift_id: int
+    device_id: str
+    shift_start: datetime
+    shift_end: datetime
+    revision: int
+    totals: ReasonMinutes  # 该修订总数；available=True 时与各区间分钟之和相等
+    available: bool
+    segments: list[AttributionInterval] | None = None
+    reason: str | None = None  # available=False 时说明不可用原因
+
